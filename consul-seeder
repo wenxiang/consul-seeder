@@ -1,0 +1,117 @@
+#!/usr/bin/env python
+import argparse
+import base64
+import glob
+import json
+import os
+import time
+
+import requests
+import yaml
+
+CONSUL_ADDR = os.environ.get('CONSUL_ADDR', 'http://localhost:8500')
+
+def dump(serializer):
+	l = requests.get(CONSUL_ADDR + '/v1/kv/?recurse').json()
+	rv = {}
+	for kv in l:
+		val = json.loads(base64.b64decode(kv['Value']))
+		key = kv['Key']
+		parts = key.split('/')
+		d = rv
+		for i, part in enumerate(parts):
+			if i + 1 == len(parts):
+				d[part] = val
+			else:
+				part += '/'
+				if part in d:
+					d = d[part]
+				else:
+					d[part] = d = {}
+
+	print serializer(rv)
+
+def dump_yaml():
+	dump(lambda v: yaml.safe_dump(v, default_flow_style=False))
+
+def dump_json():
+	dump(lambda v: json.dumps(v, indent=2, sort_keys=True))
+
+def expand(value):
+	if isinstance(value, (str, unicode)):
+		return os.path.expandvars(value)
+	elif isinstance(value, list):
+		return [expand(el) for el in value]
+	elif isinstance(value, dict):
+		d = {}
+		for k, v in value.iteritems():
+			d[k] = expand(v)
+		return d
+	return value
+
+def descend_tree(prefix, kvs, overwrite):
+	for k, v in kvs.iteritems():
+		key = prefix + k
+		if key[-1] == '/':
+			descend_tree(key, v, overwrite)
+		else:
+			print 'Setting', key, '...',
+			is_raw = key.endswith('!raw')
+			key = key[:-4] if is_raw else key
+			url = CONSUL_ADDR + '/v1/kv/' + key
+			if not overwrite:
+				url += '?cas=0'
+			v = expand(v)
+			data = v if is_raw else json.dumps(v, indent=2)
+			resp = requests.put(url, data=data)
+			if resp.text.strip() == 'true':
+				print 'Success'
+			else:
+				print 'Failed'
+
+def process_files(filenames, overwrite):
+	for fname in filenames:
+		print 'Processing %s' %  fname
+		f = open(fname, 'r')
+		if fname.endswith('.yml'):
+			kvs = yaml.safe_load(f)
+		elif fname.endswith('.json'):
+			kvs = json.load(f)
+		else:
+			print 'Unknown file type: %s' % fname
+			continue
+
+		descend_tree('', kvs, overwrite)
+
+def wait_for_consul():
+	while True:
+		try:
+			resp = requests.get(CONSUL_ADDR + '/v1/status/leader')
+			if resp.json() != '':
+				break
+		except:
+			pass
+		print 'Waiting for Consul to start...'
+		time.sleep(0.3)
+
+def parse():
+	parser = argparse.ArgumentParser()
+	parser.add_argument('paths', nargs='+', type=str)
+	parser.add_argument('--overwrite', '-o', action='store_true')
+	return parser.parse_args()
+
+def main():
+	wait_for_consul()
+	args = parse()
+	files = []
+	for path in args.paths:
+		if path.endswith(('.json', '.yml')):
+			files.append(path)
+		else:
+			files.extend(glob.glob(os.path.join(path, '*.json')))
+			files.extend(glob.glob(os.path.join(path, '*.yml')))
+
+	process_files(files, args.overwrite)
+
+if __name__ == '__main__':
+	main()
